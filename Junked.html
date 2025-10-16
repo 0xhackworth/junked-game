@@ -921,7 +921,9 @@
                 const isCurrentPlayer = game.playerOrder[game.currentPlayerIndex] === userId;
                 const price = getBuyPrice(bond.rating);
                 const color = getRatingColor(bond.rating);
-                const myCash = game.players[userId]?.cash || 0;
+                
+                // FIX: Removed unnecessary myCash check from HTML disabled attribute
+                const isDisabled = !isCurrentPlayer || game.phase !== 3 || game.tenderOffer;
                 
                 return `
                     <div class="p-4 bg-white shadow-lg rounded-xl border ${bond.rating === 'D' ? 'border-red-700' : 'border-gray-200'}">
@@ -933,7 +935,7 @@
                         <p class="text-lg mt-2 font-extrabold text-indigo-700">Buy: ${price}k</p>
                         <button onclick="performGameAction('BUY_BOND', {bondId: '${bond.id}'})" 
                                 class="mt-2 w-full bg-indigo-500 text-white p-1 rounded-lg hover:bg-indigo-600 disabled:opacity-50 disabled:cursor-not-allowed"
-                                ${!isCurrentPlayer || myCash < price || game.phase !== 3 || game.tenderOffer ? 'disabled' : ''}>
+                                ${isDisabled ? 'disabled' : ''}>
                                 Buy
                         </button>
                     </div>
