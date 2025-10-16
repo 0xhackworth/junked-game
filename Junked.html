@@ -294,6 +294,7 @@
                                 securedAssets: 0,
                                 actionsLeft: 0,
                                 name: playerName,
+                                primary: false,
                                 id: userId,
                             };
                             
@@ -418,6 +419,33 @@
 
             return log;
         };
+        
+        // FIX: Wrapper function to handle async errors and display feedback to the user
+        const handleActionError = (promise) => {
+            promise.catch(error => {
+                const feedbackEl = document.getElementById('action-feedback');
+                let message = error.message.replace('Error: ', '');
+                
+                // Special check for transaction abortion (common Firebase issue when network is slow)
+                if (message.includes('transaction failed')) {
+                    message = 'Transaction Conflict: Please try action again.';
+                }
+                
+                if (feedbackEl) {
+                    // Display error message for 5 seconds
+                    feedbackEl.textContent = `ACTION FAILED: ${message}`;
+                    feedbackEl.className = 'text-center p-2 mt-2 bg-red-100 text-red-700 rounded-lg font-bold transition-opacity duration-300';
+                    
+                    // Use a short delay before clearing the message
+                    setTimeout(() => { 
+                        feedbackEl.textContent = ''; 
+                        feedbackEl.className = ''; 
+                    }, 5000);
+                } else {
+                     console.error("Unhandleable Action Error:", error);
+                }
+            });
+        };
 
         // --- MULTIPLAYER ACTIONS (TRANSACTIONS) ---
 
@@ -516,7 +544,7 @@
 
                         // --- TRADING ACTIONS (Phase 3) ---
                         case 'BUY_BOND':
-                            // FIX: Use double equals (==) to compare string payload.bondId to numeric bond.id
+                            // FIX: Use loose equality (==) to compare string payload.bondId to numeric bond.id
                             const bondIndex = game.offeringsTrack.findIndex(b => b.id == payload.bondId);
                             if (bondIndex === -1) throw new Error(`Bond not found on the track. ID provided: ${payload.bondId}`);
                             const bond = game.offeringsTrack[bondIndex];
@@ -926,7 +954,7 @@
                 // Logic to disable the button if not current player, not Phase 3, or Tender is active
                 const isDisabled = !isCurrentPlayer || game.phase !== 3 || game.tenderOffer;
                 
-                // FIX: Added handleActionError wrapper around performGameAction
+                // FIX: Pass bond.id as a number (by removing quotes from the object literal)
                 return `
                     <div class="p-4 bg-white shadow-lg rounded-xl border ${bond.rating === 'D' ? 'border-red-700' : 'border-gray-200'}">
                         <p class="font-bold text-lg">${bond.name.split('(')[0].trim()}</p>
@@ -935,7 +963,7 @@
                         <p class="text-sm">Yield: <span class="font-bold">${bond.yield}k</span></p>
                         <p class="text-sm">Rating: <span class="font-bold ${color}">${getRatingLabel(bond.rating)} (${bond.rating})</span></p>
                         <p class="text-lg mt-2 font-extrabold text-indigo-700">Buy: ${price}k</p>
-                        <button onclick="handleActionError(performGameAction('BUY_BOND', {bondId: '${bond.id}'}))" 
+                        <button onclick="handleActionError(performGameAction('BUY_BOND', {bondId: ${bond.id}}))" 
                                 class="mt-2 w-full bg-indigo-500 text-white p-1 rounded-lg hover:bg-indigo-600 disabled:opacity-50 disabled:cursor-not-allowed"
                                 ${isDisabled ? 'disabled' : ''}>
                                 Buy
