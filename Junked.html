@@ -350,8 +350,10 @@
             if (confirm("WARNING: Are you sure you want to completely DELETE the current game session? This action cannot be undone.")) {
                 const gameRef = doc(db, DB_PATH(gameId));
                 try {
-                    await deleteDoc(gameRef);
-                    alert("Game session deleted successfully. Please refresh the page to start a new game.");
+                    // FIX: Use deleteDoc from firebase/firestore
+                    await deleteDoc(gameRef); 
+                    // Clear the local cache that was confusing the setup logic
+                    window.location.reload(); 
                 } catch (error) {
                     console.error("Failed to delete game session:", error);
                     alert("Error deleting game session. Check console for details.");
@@ -865,10 +867,6 @@
                     // Player is in, game is ready to start
                     phaseControl.innerHTML += `<button onclick="performGameAction('START_GAME')" class="bg-indigo-600 text-white p-2 ml-2 rounded-lg hover:bg-indigo-700">Start Game</button>`;
                 }
-                // Admin button visible during SETUP
-                phaseControl.innerHTML += `<button onclick="killGameForTesting()" class="mt-2 w-full bg-red-400 text-white p-2 rounded-lg hover:bg-red-500">Nuclear Option (Reset DB)</button>`;
-
-
             } else if (isCurrentPlayer && game.phase < 3) {
                 phaseControl.innerHTML = `<button onclick="performGameAction('NEXT_PHASE')" class="bg-indigo-600 text-white p-2 rounded-lg hover:bg-indigo-700">Advance to Phase ${game.phase + 1}</button>`;
                 document.getElementById('current-market-event').textContent = game.currentMarketEvent || 'Waiting for Market Shock...';
@@ -1154,6 +1152,8 @@
                 <button onclick="performGameAction('RESEARCH')" class="bg-gray-500 text-white p-2 rounded-lg text-sm hover:bg-gray-600" id="btn-research">Research (50k)</button>
                 <button onclick="performGameAction('PURCHASE_INSURANCE')" class="bg-blue-500 text-white p-2 rounded-lg text-sm hover:bg-blue-600" id="btn-insurance">Insurance (75k)</button>
                 <button onclick="document.getElementById('asset-maintenance-modal').classList.remove('hidden');" class="bg-green-500 text-white p-2 rounded-lg text-sm hover:bg-green-600" id="btn-asset-maintenance">Maintain (75k)</button>
+                <!-- Nuclear Option for Testing (Always Visible in Actions) -->
+                <button onclick="killGameForTesting()" class="col-span-2 bg-red-700 text-white p-2 rounded-lg hover:bg-red-800 text-sm mt-2">Nuclear Option (Reset DB)</button>
             </div>
         </div>
 
