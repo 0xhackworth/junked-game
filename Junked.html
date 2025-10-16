@@ -446,6 +446,9 @@
                 }
             });
         };
+        // Make globally accessible IMMEDIATELY (before updateUI is called)
+        window.handleActionError = handleActionError;
+
 
         // --- MULTIPLAYER ACTIONS (TRANSACTIONS) ---
 
@@ -1093,6 +1096,7 @@
         window.performGameAction = performGameAction; // Make callable from HTML
         window.setupModals = setupModals; // FIX: Make setupModals globally accessible
         window.killGameForTesting = killGameForTesting; // Make callable from HTML
+        // window.handleActionError is defined earlier
 
         // --- Modals for trading actions ---
         document.addEventListener('DOMContentLoaded', () => {
