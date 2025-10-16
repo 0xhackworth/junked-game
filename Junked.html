@@ -10,7 +10,7 @@
         // Updated SDK versions to 12.4.0 for consistency with user's snippet
         import { initializeApp } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-app.js";
         import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-auth.js";
-        import { getFirestore, doc, getDoc, setDoc, onSnapshot, runTransaction } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-firestore.js";
+        import { getFirestore, doc, getDoc, setDoc, onSnapshot, runTransaction, deleteDoc } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-firestore.js";
 
         // --- GLOBAL VARIABLES AND CONSTANTS ---
 
@@ -345,6 +345,22 @@
             }
         };
 
+        // --- ADMIN FUNCTION ---
+        const killGameForTesting = async () => {
+            if (confirm("WARNING: Are you sure you want to completely DELETE the current game session? This action cannot be undone.")) {
+                const gameRef = doc(db, DB_PATH(gameId));
+                try {
+                    await deleteDoc(gameRef);
+                    alert("Game session deleted successfully. Please refresh the page to start a new game.");
+                } catch (error) {
+                    console.error("Failed to delete game session:", error);
+                    alert("Error deleting game session. Check console for details.");
+                }
+            }
+        };
+        // --- END ADMIN FUNCTION ---
+
+
         // --- GAME LOGIC FUNCTIONS ---
 
         const getPlayerNames = (game) => {
@@ -437,35 +453,11 @@
                             if (game.playerOrder.length >= 4) throw new Error("Game is full.");
                             if (game.playerOrder.includes(userId)) throw new Error("Already joined.");
                             
-                            const playerName = `Player ${Math.floor(Math.random() * 900) + 100}`;
-                            player = {
-                                cash: GAME_CONSTANTS.STARTING_CASH,
-                                tBills: 0,
-                                bonds: [],
-                                insuranceContracts: 0,
-                                securedAssets: 0,
-                                actionsLeft: 0,
-                                name: playerName,
-                                id: userId,
-                            };
+                            const playerName = game.players[userId].name; // Use existing name
 
-                            // Give starter bonds
-                            for(let i = 0; i < 3; i++) {
-                                const starterBond = {
-                                    id: `starter-${i + 1}-${userId}`,
-                                    name: `Starter Bond ${i + 1} (Tier 2 - Mixed)`,
-                                    tier: 'T2',
-                                    industry: 'Mixed',
-                                    yield: GAME_CONSTANTS.TIERS.T2.yield,
-                                    rating: 'B',
-                                    faceValue: GAME_CONSTANTS.MAX_FACE_VALUE,
-                                };
-                                player.bonds.push(starterBond);
-                            }
-
-                            game.players[userId] = player;
+                            // Only push to playerOrder and log
                             game.playerOrder.push(userId);
-                            logMessage = `${player.name} joined the game. Total players: ${game.playerOrder.length}.`;
+                            logMessage = `${playerName} joined the game. Total players: ${game.playerOrder.length}.`;
                             break;
                         
                         case 'START_GAME':
@@ -873,6 +865,9 @@
                     // Player is in, game is ready to start
                     phaseControl.innerHTML += `<button onclick="performGameAction('START_GAME')" class="bg-indigo-600 text-white p-2 ml-2 rounded-lg hover:bg-indigo-700">Start Game</button>`;
                 }
+                // Admin button visible during SETUP
+                phaseControl.innerHTML += `<button onclick="killGameForTesting()" class="mt-2 w-full bg-red-400 text-white p-2 rounded-lg hover:bg-red-500">Nuclear Option (Reset DB)</button>`;
+
 
             } else if (isCurrentPlayer && game.phase < 3) {
                 phaseControl.innerHTML = `<button onclick="performGameAction('NEXT_PHASE')" class="bg-indigo-600 text-white p-2 rounded-lg hover:bg-indigo-700">Advance to Phase ${game.phase + 1}</button>`;
@@ -1067,6 +1062,7 @@
         window.onload = initFirebase;
         window.performGameAction = performGameAction; // Make callable from HTML
         window.setupModals = setupModals; // FIX: Make setupModals globally accessible
+        window.killGameForTesting = killGameForTesting; // Make callable from HTML
 
         // --- Modals for trading actions ---
         document.addEventListener('DOMContentLoaded', () => {
