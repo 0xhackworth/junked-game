@@ -175,12 +175,9 @@
                 db = getFirestore(app);
                 auth = getAuth(app);
 
-                const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
-                if (initialAuthToken) {
-                    await signInWithCustomToken(auth, initialAuthToken);
-                } else {
-                    await signInAnonymously(auth);
-                }
+                // FIX: Removed custom token logic to prevent auth/custom-token-mismatch error 
+                // in self-hosted environments. Rely only on signInAnonymously.
+                await signInAnonymously(auth);
 
                 onAuthStateChanged(auth, async (user) => {
                     if (user) {
@@ -275,7 +272,9 @@
                             currentMarketEvent: null,
                             tenderOffer: null, 
                         };
-                        transaction.set(gameRef, initialState);
+                        // FIX: Sanitize initial state to prevent unsupported field types (like functions)
+                        const sanitizedState = JSON.parse(JSON.stringify(initialState));
+                        transaction.set(gameRef, sanitizedState);
                         console.log("Game initialized and data set in transaction.");
                         
                     } else {
@@ -376,4 +375,921 @@
                         if ((changeFn === getNextRating || changeFn === ((r) => getNextRating(getNextRating(r)))) && oldRating === 'BB' && !isPlayerBonds) {
                             newRating = 'IG';
                         }
-     
+                        
+                        // Max BB check for Asset Maintenance
+                        if (isPlayerBonds && changeFn === getNextRating && oldRating === 'BB') {
+                             newRating = 'BB'; // Capped by action logic
+                        }
+                        
+                        // Prevent rating from moving past bounds
+                        if(GAME_CONSTANTS.RATING_ORDER.indexOf(newRating) === -1) {
+                            newRating = oldRating;
+                        }
+
+
+                        if (newRating !== oldRating) {
+                            bond.rating = newRating;
+                            log.push(`Rating change: ${bond.name} moved from ${oldRating} to ${newRating}.`);
+                        }
+                    }
+                });
+            };
+
+            processBonds(game.offeringsTrack, false);
+            processBonds(targetBonds, true);
+
+            return log;
+        };
+
+        // --- MULTIPLAYER ACTIONS (TRANSACTIONS) ---
+
+        const performGameAction = async (actionType, payload = {}) => {
+            const gameRef = doc(db, DB_PATH(gameId));
+            
+            try {
+                await runTransaction(db, async (transaction) => {
+                    const gameSnap = await transaction.get(gameRef);
+                    if (!gameSnap.exists()) return;
+                    let game = gameSnap.data();
+                    let player = game.players[userId];
+                    
+                    if (!player) throw new Error("You are not registered in this game session. Please reload or join.");
+
+                    // Prevent non-current player actions, except for insurance or joining/start
+                    if (game.playerOrder[game.currentPlayerIndex] !== userId && actionType !== 'JOIN' && actionType !== 'USE_INSURANCE' && actionType !== 'START_GAME') {
+                        throw new Error("It is not your turn.");
+                    }
+
+                    // Check for game phase and status
+                    if (game.status === 'GAME_OVER') throw new Error("The game is over.");
+                    
+                    // Deduct action count (only for Phase 3 actions)
+                    const isPhase3Action = ['BUY_BOND', 'SELL_BOND', 'DEPOSIT_WITHDRAW', 'RESEARCH', 'PURCHASE_INSURANCE', 'SABOTAGE', 'ASSET_MAINTENANCE', 'TENDER_INITIATE', 'END_TURN'].includes(actionType);
+                    if (isPhase3Action && game.phase !== 3) throw new Error("Trading actions only allowed in Phase 3.");
+                    if (isPhase3Action && player.actionsLeft <= 0 && actionType !== 'END_TURN' && actionType !== 'TENDER_RESOLVE') throw new Error("No actions left this round.");
+                    
+                    let logMessage = '';
+                    let silentPartnerId = null;
+                    let targetIdRes = null;
+
+                    switch(actionType) {
+                        case 'JOIN':
+                            if (game.playerOrder.length >= 4) throw new Error("Game is full.");
+                            if (game.playerOrder.includes(userId)) throw new Error("Already joined.");
+                            
+                            const playerName = `Player ${Math.floor(Math.random() * 900) + 100}`;
+                            player = {
+                                cash: GAME_CONSTANTS.STARTING_CASH,
+                                tBills: 0,
+                                bonds: [],
+                                insuranceContracts: 0,
+                                securedAssets: 0,
+                                actionsLeft: 0,
+                                name: playerName,
+                                id: userId,
+                            };
+
+                            // Give starter bonds
+                            for(let i = 0; i < 3; i++) {
+                                const starterBond = {
+                                    id: `starter-${i + 1}-${userId}`,
+                                    name: `Starter Bond ${i + 1} (Tier 2 - Mixed)`,
+                                    tier: 'T2',
+                                    industry: 'Mixed',
+                                    yield: GAME_CONSTANTS.TIERS.T2.yield,
+                                    rating: 'B',
+                                    faceValue: GAME_CONSTANTS.MAX_FACE_VALUE,
+                                };
+                                player.bonds.push(starterBond);
+                            }
+
+                            game.players[userId] = player;
+                            game.playerOrder.push(userId);
+                            logMessage = `${player.name} joined the game. Total players: ${game.playerOrder.length}.`;
+                            break;
+                        
+                        case 'START_GAME':
+                            if (game.playerOrder.length < 3) throw new Error("Need 3-4 players to start.");
+                            if (game.status !== 'SETUP') throw new Error("Game already started.");
+                            
+                            // Initialize actions for first player, ensure turn order is clean
+                            game.status = 'IN_PROGRESS';
+                            game.phase = 1;
+                            game.currentPlayerIndex = 0;
+                            
+                            logMessage = 'Game is now IN PROGRESS. Starting Phase 1: Yield Collection.';
+                            break;
+
+                        case 'END_TURN':
+                            if (game.phase === 3 && player.actionsLeft > 0) throw new Error("You must use both actions or manually end your turn.");
+                            
+                            // Clear current player's actions
+                            player.actionsLeft = 0;
+                            
+                            game.currentPlayerIndex = (game.currentPlayerIndex + 1) % game.playerOrder.length;
+                            game.players[game.playerOrder[game.currentPlayerIndex]].actionsLeft = 2;
+                            logMessage = `${player.name} ended their turn. It is now ${game.players[game.playerOrder[game.currentPlayerIndex]].name}'s turn.`;
+
+                            // Check if all players completed Phase 3
+                            if (game.currentPlayerIndex === 0) {
+                                if (game.round === GAME_CONSTANTS.MAX_ROUNDS) {
+                                    game.status = 'GAME_OVER';
+                                    logMessage = `Round ${game.round} ended. GAME OVER. Calculating Net Worth.`;
+                                } else {
+                                    game.round++;
+                                    game.phase = 1;
+                                    logMessage = `Starting Round ${game.round}. Phase 1: Yield Collection.`;
+                                }
+                            }
+                            break;
+                        
+                        case 'NEXT_PHASE':
+                            if (game.playerOrder[game.currentPlayerIndex] !== userId) throw new Error("Only the player who finished the phase can advance it.");
+                            if (game.phase === 1) {
+                                // Phase 1 -> Phase 2 (Yield Collection)
+                                const log = performYieldCollection(game);
+                                logMessage = log.join('; ') + `; Advancing to Phase 2: Market Shock.`;
+                                game.phase = 2;
+                            } else if (game.phase === 2) {
+                                // Phase 2 -> Phase 3 (Market Shock)
+                                const log = handleMarketShock(game);
+                                logMessage = log.join('; ') + `; Advancing to Phase 3: Trading Floor.`;
+                                game.phase = 3;
+                                game.currentPlayerIndex = 0; // Start Trading with Player 1
+                                game.players[game.playerOrder[0]].actionsLeft = 2;
+                            }
+                            break;
+
+                        // --- TRADING ACTIONS (Phase 3) ---
+                        case 'BUY_BOND':
+                            const bondIndex = game.offeringsTrack.findIndex(b => b.id === payload.bondId);
+                            if (bondIndex === -1) throw new Error("Bond not found on the track.");
+                            const bond = game.offeringsTrack[bondIndex];
+                            const price = getBuyPrice(bond.rating);
+
+                            if (player.cash < price) throw new Error(`Insufficient funds. Need ${price}k.`);
+
+                            player.cash -= price;
+                            player.bonds.push(bond);
+                            game.offeringsTrack.splice(bondIndex, 1);
+                            
+                            // Refill track
+                            const newBond = game.companyDeck.shift();
+                            if (newBond) game.offeringsTrack.push(newBond);
+
+                            player.actionsLeft--;
+                            logMessage = `${player.name} bought ${bond.name} (${bond.rating}) for ${price}k.`;
+                            break;
+
+                        case 'SELL_BOND':
+                            const sellBondIndex = player.bonds.findIndex(b => b.id === payload.bondId);
+                            if (sellBondIndex === -1) throw new Error("Bond not found in your portfolio.");
+                            const sellBond = player.bonds[sellBondIndex];
+                            const sellPrice = getSellPrice(sellBond.rating);
+
+                            if (sellBond.rating === 'D') throw new Error("Cannot sell defaulted bond (value is 0k).");
+
+                            player.cash += sellPrice;
+                            player.bonds.splice(sellBondIndex, 1);
+                            
+                            player.actionsLeft--;
+                            logMessage = `${player.name} sold ${sellBond.name} (${sellBond.rating}) for ${sellPrice}k.`;
+                            break;
+
+                        case 'DEPOSIT_WITHDRAW':
+                            const amount = parseInt(payload.amount);
+                            if (isNaN(amount) || amount % GAME_CONSTANTS.T_BILL_INCREMENT !== 0 || amount === 0) throw new Error("Amount must be a non-zero multiple of 100k.");
+
+                            if (payload.type === 'DEPOSIT') {
+                                if (player.cash < amount) throw new Error(`Insufficient cash to deposit ${amount}k.`);
+                                player.cash -= amount;
+                                player.tBills += amount;
+                                logMessage = `${player.name} deposited ${amount}k into T-Bills.`;
+                            } else if (payload.type === 'WITHDRAW') {
+                                if (player.tBills < amount) throw new Error(`Insufficient T-Bills to withdraw ${amount}k.`);
+                                player.cash += amount;
+                                player.tBills -= amount;
+                                logMessage = `${player.name} withdrew ${amount}k from T-Bills.`;
+                            }
+                            player.actionsLeft--;
+                            break;
+
+                        case 'RESEARCH':
+                            player.cash -= GAME_CONSTANTS.COST_RESEARCH;
+                            if (player.cash < 0) throw new Error("Insufficient funds for Research.");
+                            
+                            logMessage = `${player.name} paid ${GAME_CONSTANTS.COST_RESEARCH}k for Market Research (peeked at top 3 cards).`;
+                            player.actionsLeft--;
+                            break;
+                            
+                        case 'PURCHASE_INSURANCE':
+                            player.cash -= GAME_CONSTANTS.COST_INSURANCE;
+                            if (player.cash < 0) throw new Error("Insufficient funds for Insurance.");
+                            
+                            player.insuranceContracts++;
+                            logMessage = `${player.name} purchased a single-use Insurance Contract for ${GAME_CONSTANTS.COST_INSURANCE}k.`;
+                            player.actionsLeft--;
+                            break;
+
+                        case 'ASSET_MAINTENANCE':
+                            if (player.bonds.length === 0) throw new Error("No bonds to maintain.");
+                            player.cash -= GAME_CONSTANTS.COST_ASSET_MAINTENANCE;
+                            if (player.cash < 0) throw new Error("Insufficient funds for Asset Maintenance.");
+                            
+                            const maintainBondIndex = player.bonds.findIndex(b => b.id === payload.bondId);
+                            if (maintainBondIndex === -1) throw new Error("Bond not found in your portfolio.");
+                            const maintainBond = player.bonds[maintainBondIndex];
+
+                            if (maintainBond.rating === 'IG' || maintainBond.rating === 'D') throw new Error("Cannot maintain Investment Grade or Defaulted bonds.");
+                            
+                            if (maintainBond.rating === 'BB') throw new Error("Asset Maintenance is capped at the BB rating.");
+
+                            maintainBond.rating = getNextRating(maintainBond.rating);
+                            player.actionsLeft--;
+                            logMessage = `${player.name} paid ${GAME_CONSTANTS.COST_ASSET_MAINTENANCE}k for Asset Maintenance on ${maintainBond.name}. Upgraded to ${maintainBond.rating}.`;
+                            break;
+                            
+                        case 'SABOTAGE':
+                            player.cash -= GAME_CONSTANTS.COST_SABOTAGE;
+                            if (player.cash < 0) throw new Error("Insufficient funds for Sabotage.");
+                            
+                            const targetPlayer = game.players[payload.targetId];
+                            const targetBondIndex = targetPlayer.bonds.findIndex(b => b.id === payload.bondId);
+                            if (!targetPlayer || targetBondIndex === -1) throw new Error("Target player or bond not found.");
+                            
+                            // Force a Malfeasance Card
+                            const sabotageCard = game.malfeasanceDeck.shift();
+                            if (!sabotageCard || sabotageCard.type === 'BACKFIRE') {
+                                // If a backfire is drawn on a normal sabotage action, the card is returned and the action is wasted.
+                                if(sabotageCard) game.malfeasanceDeck.unshift(sabotageCard);
+                                throw new Error("Sabotage attempt wasted. Malfeasance card was a Due Diligence Backfire.");
+                            }
+                            
+                            const targetBond = targetPlayer.bonds[targetBondIndex];
+                            const oldRating = targetBond.rating;
+                            targetBond.rating = getPrevRating(oldRating, sabotageCard.downgrade || 2); // Default 2 steps
+                            
+                            logMessage = `${player.name} paid ${GAME_CONSTANTS.COST_SABOTAGE}k to launch a Sabotage attack on ${targetPlayer.name}'s ${targetBond.name}. Rating dropped from ${oldRating} to ${targetBond.rating}.`;
+                            player.actionsLeft--;
+                            break;
+
+                        case 'TENDER_INITIATE':
+                            if (game.round <= GAME_CONSTANTS.TARGET_RESTRICTION_ROUNDS) throw new Error(`Hostile Tenders restricted until Round ${GAME_CONSTANTS.TARGET_RESTRICTION_ROUNDS + 1}.`);
+                            if (game.tenderOffer) throw new Error("A Tender Offer is already in progress.");
+                            if (payload.targetId === userId) throw new Error("Cannot target your own bonds.");
+                            if (player.cash < GAME_CONSTANTS.BRIBE_AMOUNT) throw new Error(`Need ${GAME_CONSTANTS.BRIBE_AMOUNT}k for the bribe.`);
+                            
+                            // Check Silent Partner solvency before initiation
+                            const silentPartnerCheck = game.players[payload.silentPartnerId];
+                            const MIN_SOLVENCY = GAME_CONSTANTS.RICO_FINE + GAME_CONSTANTS.BRIBE_AMOUNT;
+                            if(silentPartnerCheck.cash < MIN_SOLVENCY) throw new Error(`Silent Partner lacks the minimum ${MIN_SOLVENCY}k solvency to cover the fine risk.`);
+
+
+                            game.tenderOffer = {
+                                leadRaider: userId,
+                                silentPartner: payload.silentPartnerId,
+                                targetBondId: payload.bondId,
+                                targetId: payload.targetId,
+                                step: 1,
+                            };
+                            
+                            // Player pays bribe now (Contingent Liability is handled in Backfire)
+                            player.cash -= GAME_CONSTANTS.BRIBE_AMOUNT; 
+                            
+                            logMessage = `${player.name} initiated a Hostile Tender Offer with ${game.players[payload.silentPartnerId].name} against a bond held by ${game.players[payload.targetId].name}. ${player.name} paid ${GAME_CONSTANTS.BRIBE_AMOUNT}k bribe.`;
+                            player.actionsLeft--;
+                            break;
+
+                        case 'TENDER_RESOLVE':
+                            if (!game.tenderOffer || game.tenderOffer.leadRaider !== userId) throw new Error("No active Tender Offer to resolve.");
+
+                            silentPartnerId = game.tenderOffer.silentPartner;
+                            targetIdRes = game.tenderOffer.targetId;
+                            const targetBondIdRes = game.tenderOffer.targetBondId;
+                            
+                            const targetPlayerRes = game.players[targetIdRes];
+                            const silentPartnerRes = game.players[silentPartnerId];
+                            
+                            const malfeasanceCard = game.malfeasanceDeck.shift();
+                            let resolutionLog = [];
+                            
+                            if (malfeasanceCard.type === 'BACKFIRE') {
+                                // 1. RICO FINE
+                                player.cash -= GAME_CONSTANTS.RICO_FINE;
+                                silentPartnerRes.cash -= GAME_CONSTANTS.RICO_FINE;
+                                resolutionLog.push(`RICO FINE: Lead Raider (${player.name}) and Silent Partner (${silentPartnerRes.name}) each pay ${GAME_CONSTANTS.RICO_FINE}k.`);
+                                
+                                // 2. BRIBE REPAYMENT (Contingent Liability)
+                                player.cash += GAME_CONSTANTS.BRIBE_AMOUNT; // Raider gets bribe back
+                                silentPartnerRes.cash -= GAME_CONSTANTS.BRIBE_AMOUNT; // Partner pays bribe back (total -500k)
+                                resolutionLog.push(`Bribe Repaid: Silent Partner returned ${GAME_CONSTANTS.BRIBE_AMOUNT}k to Raider.`);
+                                
+                                // 3. TARGET COMPENSATION
+                                targetPlayerRes.cash += GAME_CONSTANTS.TARGET_COMPENSATION;
+                                resolutionLog.push(`Target (${targetPlayerRes.name}) compensated ${GAME_CONSTANTS.TARGET_COMPENSATION}k.`);
+
+                                // Handle insolvency
+                                if (silentPartnerRes.cash < 0) resolutionLog.push(`${silentPartnerRes.name} is insolvent and must sell assets next turn to cover deficit.`);
+                                if (player.cash < 0) resolutionLog.push(`${player.name} is insolvent and must sell assets next turn to cover deficit.`);
+                                
+                                logMessage = `Tender Offer Backfired! ${resolutionLog.join(' ')}`;
+                            } else {
+                                // SUCCESSFUL SABOTAGE (BOND DEFAULT CHECK)
+                                const targetBondIndex = targetPlayerRes.bonds.findIndex(b => b.id === targetBondIdRes);
+                                const targetBond = targetPlayerRes.bonds[targetBondIndex];
+                                
+                                const oldRating = targetBond.rating;
+                                targetBond.rating = getPrevRating(oldRating, malfeasanceCard.downgrade || 2);
+                                
+                                resolutionLog.push(`Malfeasance: ${malfeasanceCard.desc}. ${targetBond.name} drops to ${targetBond.rating}.`);
+
+                                if (targetBond.rating === 'D') {
+                                    // 1. ASSET SEIZURE
+                                    targetPlayerRes.bonds.splice(targetBondIndex, 1);
+                                    player.securedAssets++;
+                                    resolutionLog.push(`SUCCESS! ${targetBond.name} defaulted. ${player.name} seized a Secured Asset.`);
+                                    
+                                    // 2. LIQUIDATION BONUS
+                                    player.cash += GAME_CONSTANTS.LIQUIDATION_BONUS;
+                                    resolutionLog.push(`${player.name} gained ${GAME_CONSTANTS.LIQUIDATION_BONUS}k Liquidation Bonus.`);
+                                    
+                                    logMessage = `Tender Offer Succeeded! ${resolutionLog.join(' ')}`;
+                                } else {
+                                    logMessage = `Tender Offer Sabotage deployed, but ${targetBond.name} survived at ${targetBond.rating}. ${resolutionLog.join(' ')}`;
+                                }
+                            }
+
+                            game.tenderOffer = null; // Clear the offer
+
+                            // FIX: Update player objects modified in TENDER_RESOLVE before transaction.set
+                            game.players[userId] = player;
+                            game.players[silentPartnerId] = silentPartnerRes;
+                            game.players[targetIdRes] = targetPlayerRes;
+
+                            // No action deduction as this is a resolution step outside the normal action limit
+                            break;
+                    }
+
+                    if (logMessage) {
+                        game.log.push({ time: new Date().toISOString(), message: logMessage });
+                    }
+
+                    // Only update the player object if it was the current player executing a non-Tender action
+                    if (isPhase3Action && actionType !== 'TENDER_RESOLVE') {
+                        game.players[userId] = player; 
+                    }
+
+                    transaction.set(gameRef, game);
+
+                });
+            } catch (error) {
+                 // Throw the error so the UI handler can display it as an alert
+                 console.error("Game Action Failed:", error.message);
+                 throw error;
+            }
+        };
+        
+        // Helper function for yield collection phase
+        const performYieldCollection = (game) => {
+            const log = [];
+            Object.keys(game.players).forEach(pId => {
+                const player = game.players[pId];
+                let yieldTotal = 0;
+                
+                // 1. Bond Yield
+                player.bonds.forEach(bond => {
+                    if (bond.rating !== 'D') {
+                        player.cash += bond.yield;
+                        yieldTotal += bond.yield;
+                    }
+                });
+
+                // 2. T-Bill Yield
+                if (player.tBills > 0) {
+                    const tBillYield = Math.floor(player.tBills * GAME_CONSTANTS.T_BILL_YIELD_RATE);
+                    player.cash += tBillYield;
+                    yieldTotal += tBillYield;
+                }
+                
+                if (yieldTotal > 0) {
+                    log.push(`${player.name} collected ${yieldTotal}k in total yield.`);
+                } else {
+                    log.push(`${player.name} collected no yield this round.`);
+                }
+            });
+            return log;
+        };
+
+        // Helper function for market shock phase
+        const handleMarketShock = (game) => {
+            const log = [];
+            const card = game.marketDeck.shift();
+            if (!card) {
+                log.push('Market Deck empty! Reshuffling...');
+                game.marketDeck = createMarketDeck();
+                return log;
+            }
+
+            game.currentMarketEvent = card.desc;
+            log.push(`Market Event: ${card.desc}`);
+
+            if (card.effect) {
+                const changeLog = card.effect(game);
+                log.push(...changeLog);
+            }
+
+            if (card.roll) {
+                // Simplified default roll: check all applicable bonds
+                Object.keys(game.players).forEach(pId => {
+                    const player = game.players[pId];
+                    const bondsToRoll = player.bonds.filter(b => b.industry === card.industry);
+                    
+                    bondsToRoll.forEach(bond => {
+                        const roll = Math.floor(Math.random() * 6) + 1;
+                        // Default roll is 1-3 on D6 for now
+                        if (roll <= 3) {
+                            if (player.insuranceContracts > 0) {
+                                player.insuranceContracts--;
+                                log.push(`${player.name} used Insurance to prevent ${bond.name} default!`);
+                            } else {
+                                bond.rating = 'D';
+                                log.push(`${player.name}'s ${bond.name} defaulted on a roll of ${roll}!`);
+                            }
+                        } else {
+                            log.push(`${player.name}'s ${bond.name} survived the roll (${roll}).`);
+                        }
+                    });
+                });
+            }
+
+            return log;
+        };
+        
+        // --- UI RENDERING ---
+
+        const updateUI = (game) => {
+            document.getElementById('current-round').textContent = game.round;
+            document.getElementById('max-rounds').textContent = GAME_CONSTANTS.MAX_ROUNDS;
+            document.getElementById('game-status').textContent = game.status;
+            document.getElementById('game-phase').textContent = ['Yield Collection', 'Market Shock', 'Trading Floor'][game.phase - 1] || 'N/A';
+            
+            const currentPlayerId = game.playerOrder[game.currentPlayerIndex];
+            const isCurrentPlayer = game.playerOrder.includes(userId) && currentPlayerId === userId;
+            const myPlayer = game.players[userId];
+
+            // Ensure myPlayer exists before trying to access properties
+            if (!myPlayer) {
+                 document.getElementById('player-name').textContent = 'Connecting...';
+                 document.getElementById('phase-control').innerHTML = '<p class="text-sm mt-2 text-yellow-600">Attempting to join game session...</p>';
+                 return; 
+            }
+            
+            document.getElementById('player-name').textContent = myPlayer.name || 'Loading...';
+            document.getElementById('player-cash').textContent = myPlayer.cash?.toLocaleString() || '0';
+            document.getElementById('player-tbills').textContent = myPlayer.tBills?.toLocaleString() || '0';
+            document.getElementById('player-insurance').textContent = myPlayer.insuranceContracts || '0';
+            document.getElementById('player-secured-assets').textContent = myPlayer.securedAssets || '0';
+            document.getElementById('player-actions').textContent = myPlayer.actionsLeft || '0';
+            document.getElementById('current-player').textContent = game.players[currentPlayerId]?.name || getPlayerDisplayId(currentPlayerId);
+            
+            // Log
+            const logHTML = game.log.slice(-10).reverse().map(entry => {
+                return `<p class="text-xs text-gray-500">${new Date(entry.time).toLocaleTimeString()}</p><p class="text-sm">${entry.message}</p>`;
+            }).join('<hr class="my-1 border-gray-100">');
+            document.getElementById('game-log').innerHTML = logHTML;
+
+            // Conditional Buttons
+            const phaseControl = document.getElementById('phase-control');
+            phaseControl.innerHTML = '';
+            
+            if (game.status === 'SETUP') {
+                if (!game.playerOrder.includes(userId)) {
+                    // Player is not in the player order list (manual join needed if auto-add failed)
+                    phaseControl.innerHTML += `<button onclick="performGameAction('JOIN')" class="bg-blue-600 text-white p-2 rounded-lg hover:bg-blue-700">Join Game</button>`;
+                } else if (game.playerOrder.length < 3) {
+                     // Player is in, waiting for more players
+                     phaseControl.innerHTML += `<p class="text-sm mt-2 text-yellow-600">Waiting for 3-4 players (currently ${game.playerOrder.length}).</p>`;
+                } else if (game.playerOrder.includes(userId) && game.playerOrder.length >= 3) {
+                    // Player is in, game is ready to start
+                    phaseControl.innerHTML += `<button onclick="performGameAction('START_GAME')" class="bg-indigo-600 text-white p-2 ml-2 rounded-lg hover:bg-indigo-700">Start Game</button>`;
+                }
+
+            } else if (isCurrentPlayer && game.phase < 3) {
+                phaseControl.innerHTML = `<button onclick="performGameAction('NEXT_PHASE')" class="bg-indigo-600 text-white p-2 rounded-lg hover:bg-indigo-700">Advance to Phase ${game.phase + 1}</button>`;
+                document.getElementById('current-market-event').textContent = game.currentMarketEvent || 'Waiting for Market Shock...';
+            } else if (isCurrentPlayer && game.phase === 3) {
+                 phaseControl.innerHTML = `<button onclick="performGameAction('END_TURN')" class="bg-orange-600 text-white p-2 rounded-lg hover:bg-orange-700 disabled:opacity-50" ${myPlayer.actionsLeft > 0 ? '' : ''}>End Turn</button>`;
+                 document.getElementById('current-market-event').textContent = 'Players execute 2 actions.';
+            } else {
+                phaseControl.innerHTML = `<p class="text-sm text-gray-600">Waiting for ${game.players[currentPlayerId]?.name} to act.</p>`;
+                document.getElementById('current-market-event').textContent = game.currentMarketEvent || 'Market is stable.';
+            }
+            
+            // Tenders Display
+            renderTenders(game);
+
+            // Offerings Track
+            renderOfferings(game);
+
+            // Portfolios
+            renderPortfolios(game);
+            
+            // Setup modals with current game data
+            window.setupModals(game);
+        };
+
+        const renderTenders = (game) => {
+             const tenderDiv = document.getElementById('tender-offer-status');
+             tenderDiv.innerHTML = '';
+             tenderDiv.className = 'p-4 rounded-lg mt-4';
+             
+             if (game.tenderOffer) {
+                 tenderDiv.classList.add('bg-red-100', 'border', 'border-red-400');
+                 const raider = game.players[game.tenderOffer.leadRaider]?.name || 'Unknown';
+                 const partner = game.players[game.tenderOffer.silentPartner]?.name || 'Unknown';
+                 const target = game.players[game.tenderOffer.targetId]?.name || 'Unknown';
+                 
+                 tenderDiv.innerHTML = `
+                    <p class="font-bold text-lg text-red-700">HOSTILE TENDER OFFER IN PROGRESS!</p>
+                    <p class="text-sm text-gray-700">Raider: ${raider} | Partner: ${partner} | Target: ${target}</p>
+                    ${game.tenderOffer.leadRaider === userId && game.phase === 3 ? 
+                        `<button onclick="performGameAction('TENDER_RESOLVE')" class="mt-2 bg-red-700 text-white p-2 rounded-lg hover:bg-red-800">Resolve Tender Sabotage</button>` :
+                        `<p class="text-sm mt-1">Waiting for Raider (${raider}) to resolve the sabotage.</p>`
+                    }
+                 `;
+             } else {
+                 tenderDiv.classList.add('bg-gray-50', 'border', 'border-gray-200');
+                 tenderDiv.innerHTML = `<p class="text-sm text-gray-500">No active Hostile Tender Offer.</p>`;
+             }
+        };
+
+        const renderOfferings = (game) => {
+            const trackHTML = game.offeringsTrack.map(bond => {
+                const isCurrentPlayer = game.playerOrder[game.currentPlayerIndex] === userId;
+                const price = getBuyPrice(bond.rating);
+                const color = getRatingColor(bond.rating);
+                const myCash = game.players[userId]?.cash || 0;
+                
+                return `
+                    <div class="p-4 bg-white shadow-lg rounded-xl border ${bond.rating === 'D' ? 'border-red-700' : 'border-gray-200'}">
+                        <p class="font-bold text-lg">${bond.name.split('(')[0].trim()}</p>
+                        <p class="text-xs text-gray-500">${bond.name.split('(')[1]}</p>
+                        <hr class="my-2">
+                        <p class="text-sm">Yield: <span class="font-bold">${bond.yield}k</span></p>
+                        <p class="text-sm">Rating: <span class="font-bold ${color}">${getRatingLabel(bond.rating)} (${bond.rating})</span></p>
+                        <p class="text-lg mt-2 font-extrabold text-indigo-700">Buy: ${price}k</p>
+                        <button onclick="performGameAction('BUY_BOND', {bondId: '${bond.id}'})" 
+                                class="mt-2 w-full bg-indigo-500 text-white p-1 rounded-lg hover:bg-indigo-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                                ${!isCurrentPlayer || myCash < price || game.phase !== 3 || game.tenderOffer ? 'disabled' : ''}>
+                                Buy
+                        </button>
+                    </div>
+                `;
+            }).join('');
+            document.getElementById('offerings-track').innerHTML = trackHTML;
+        };
+
+        const renderPortfolios = (game) => {
+            const portfoliosDiv = document.getElementById('portfolios');
+            portfoliosDiv.innerHTML = game.playerOrder.map(pId => {
+                const player = game.players[pId];
+                const isMine = pId === userId;
+                const isCurrent = game.playerOrder[game.currentPlayerIndex] === pId;
+                const isTargetable = !isMine && game.round > GAME_CONSTANTS.TARGET_RESTRICTION_ROUNDS;
+                
+                let netWorth = player.cash + player.tBills + (player.securedAssets * GAME_CONSTANTS.SECURED_ASSET_VALUE);
+                player.bonds.forEach(b => {
+                    netWorth += getSellPrice(b.rating);
+                });
+
+                const bondCardsHTML = player.bonds.map(bond => {
+                    const sellPrice = getSellPrice(bond.rating);
+                    const color = getRatingColor(bond.rating);
+                    const isDefaulted = bond.rating === 'D';
+                    
+                    const actionButtons = isMine && isCurrent && game.phase === 3 && !game.tenderOffer ? `
+                        <button onclick="performGameAction('SELL_BOND', {bondId: '${bond.id}'})" class="text-xs bg-red-400 text-white p-1 rounded-md hover:bg-red-500 disabled:opacity-50" ${isDefaulted ? 'disabled' : ''}>Sell (${sellPrice}k)</button>
+                    ` : !isMine && game.phase === 3 && !game.tenderOffer && isTargetable ? `
+                        <button onclick="document.getElementById('tender-modal-target-bond').value='${bond.id}'; document.getElementById('tender-modal-target-id').value='${pId}'; document.getElementById('tender-modal-target-name').value='${player.name}'; window.setupModals(game); document.getElementById('tender-modal').classList.remove('hidden');" class="text-xs bg-red-800 text-white p-1 rounded-md hover:bg-red-900">Tender Offer</button>
+                    ` : '';
+
+                    return `
+                        <div class="p-2 bg-gray-50 rounded-lg shadow-inner ${isDefaulted ? 'opacity-60 line-through' : ''}">
+                            <p class="text-sm font-semibold">${bond.name.split('(')[0].trim()}</p>
+                            <p class="text-xs ${color}">RATING: ${bond.rating} (${getRatingLabel(bond.rating)})</p>
+                            <p class="text-xs">Yield: ${bond.yield}k | Value: ${sellPrice}k</p>
+                            ${actionButtons}
+                        </div>
+                    `;
+                }).join('');
+
+                const sabotageButton = isCurrent && game.phase === 3 && !game.tenderOffer && !isMine ? `
+                     <button onclick="document.getElementById('sabotage-modal-target-id').value='${pId}'; document.getElementById('sabotage-modal-target-name').textContent='${player.name}'; window.setupModals(game); document.getElementById('sabotage-modal').classList.remove('hidden');" class="mt-2 w-full bg-red-900 text-white p-2 rounded-lg hover:bg-red-800">Sabotage (${GAME_CONSTANTS.COST_SABOTAGE}k)</button>
+                ` : '';
+
+                return `
+                    <div class="w-full lg:w-1/2 p-2">
+                        <div class="rounded-xl p-4 shadow-2xl ${isCurrent ? 'border-4 border-indigo-500 bg-white' : 'border border-gray-200 bg-gray-50'}">
+                            <div class="flex justify-between items-center mb-3">
+                                <h3 class="text-xl font-bold ${isCurrent ? 'text-indigo-700' : 'text-gray-800'}">${player.name} ${isMine ? '(You)' : ''}</h3>
+                                <p class="text-lg font-extrabold text-green-700">NW: ${netWorth.toLocaleString()}k</p>
+                            </div>
+                            <p class="text-sm">Cash: ${player.cash.toLocaleString()}k | T-Bills: ${player.tBills.toLocaleString()}k | Ins: ${player.insuranceContracts} | Ass: ${player.securedAssets}</p>
+                            
+                            <div class="mt-3 grid grid-cols-2 gap-2 max-h-48 overflow-y-auto">
+                                ${bondCardsHTML.length ? bondCardsHTML : `<p class="text-xs text-gray-400">No bonds held.</p>`}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+            portfoliosDiv.innerHTML = portfoliosDiv.innerHTML = `<div class="flex flex-wrap -m-2">${portfoliosDiv.innerHTML}</div>`;
+        };
+
+        // --- MODAL AND UI INTERACTION ---
+
+        const setupModals = (game) => {
+             // Populate Silent Partner Select in Tender Modal
+            const silentPartnerSelect = document.getElementById('tender-modal-silent-partner');
+            if (silentPartnerSelect) {
+                const targetId = document.getElementById('tender-modal-target-id').value;
+                const otherPlayers = game.playerOrder.filter(pId => pId !== userId && pId !== targetId);
+                
+                silentPartnerSelect.innerHTML = '<option value="" disabled selected>Select Silent Partner</option>';
+                const MIN_SOLVENCY = GAME_CONSTANTS.RICO_FINE + GAME_CONSTANTS.BRIBE_AMOUNT;
+                
+                otherPlayers.forEach(pId => {
+                    const player = game.players[pId];
+                    if (player.cash >= MIN_SOLVENCY) {
+                         silentPartnerSelect.innerHTML += `<option value="${pId}">${player.name} (Solvent)</option>`;
+                    } else {
+                         silentPartnerSelect.innerHTML += `<option value="${pId}" disabled>${player.name} (Insolvent: Need ${MIN_SOLVENCY - player.cash}k more)</option>`;
+                    }
+                });
+            }
+            
+            // Populate Bond Select in Sabotage Modal
+            const sabotageBondSelect = document.getElementById('sabotage-modal-bond');
+            if (sabotageBondSelect) {
+                sabotageBondSelect.innerHTML = '<option value="" disabled selected>Select Bond to Target</option>';
+                const targetId = document.getElementById('sabotage-modal-target-id').value;
+                if (targetId && game.players[targetId]) {
+                    game.players[targetId].bonds.forEach(bond => {
+                        if (bond.rating !== 'D') {
+                            sabotageBondSelect.innerHTML += `<option value="${bond.id}">${bond.name} (${bond.rating} - ${getSellPrice(bond.rating)}k)</option>`;
+                        }
+                    });
+                }
+            }
+            
+            // Populate Bond Select in Asset Maintenance Modal
+            const maintainBondSelect = document.getElementById('asset-maintenance-bond');
+            if (maintainBondSelect) {
+                maintainBondSelect.innerHTML = '<option value="" disabled selected>Select Bond to Maintain</option>';
+                const myPlayer = game.players[userId];
+                if (myPlayer) {
+                     myPlayer.bonds.forEach(bond => {
+                         if (bond.rating !== 'IG' && bond.rating !== 'D' && bond.rating !== 'BB') {
+                             maintainBondSelect.innerHTML += `<option value="${bond.id}">${bond.name} (${bond.rating})</option>`;
+                         }
+                     });
+                }
+            }
+            
+            // Set Target Name for Tender Modal Display
+            const tenderTargetNameInput = document.getElementById('tender-modal-target-name');
+            const tenderTargetNameDisplay = document.getElementById('tender-modal-target-name-display');
+            if(tenderTargetNameInput && tenderTargetNameDisplay) {
+                tenderTargetNameDisplay.textContent = tenderTargetNameInput.value;
+            }
+        };
+
+        window.onload = initFirebase;
+        window.performGameAction = performGameAction; // Make callable from HTML
+        window.setupModals = setupModals; // FIX: Make setupModals globally accessible
+
+        // --- Modals for trading actions ---
+        document.addEventListener('DOMContentLoaded', () => {
+             // General Action Modals
+             const actionButtons = [
+                 { id: 'btn-research', action: 'RESEARCH', cost: GAME_CONSTANTS.COST_RESEARCH },
+                 { id: 'btn-insurance', action: 'PURCHASE_INSURANCE', cost: GAME_CONSTANTS.COST_INSURANCE },
+             ];
+             
+             actionButtons.forEach(btn => {
+                 const el = document.getElementById(btn.id);
+                 if(el) { el.textContent = `${el.textContent.split('(')[0].trim()} (${btn.cost}k)`; }
+             });
+             
+             document.getElementById('btn-asset-maintenance').textContent = `Maintain (${GAME_CONSTANTS.COST_ASSET_MAINTENANCE}k)`;
+
+
+             // Submit handlers
+             document.getElementById('form-deposit-withdraw').addEventListener('submit', (e) => {
+                 e.preventDefault();
+                 const type = e.target.querySelector('select[name="type"]').value;
+                 const amount = e.target.querySelector('input[name="amount"]').value;
+                 performGameAction('DEPOSIT_WITHDRAW', { type, amount: parseInt(amount) }).catch(console.error);
+                 document.getElementById('deposit-withdraw-modal').classList.add('hidden');
+             });
+
+             document.getElementById('form-sabotage').addEventListener('submit', (e) => {
+                 e.preventDefault();
+                 const targetId = e.target.querySelector('#sabotage-modal-target-id').value;
+                 const bondId = e.target.querySelector('#sabotage-modal-bond').value;
+                 performGameAction('SABOTAGE', { targetId, bondId }).catch(console.error);
+                 document.getElementById('sabotage-modal').classList.add('hidden');
+             });
+             
+             document.getElementById('form-asset-maintenance').addEventListener('submit', (e) => {
+                 e.preventDefault();
+                 const bondId = e.target.querySelector('#asset-maintenance-bond').value;
+                 performGameAction('ASSET_MAINTENANCE', { bondId }).catch(console.error);
+                 document.getElementById('asset-maintenance-modal').classList.add('hidden');
+             });
+
+             document.getElementById('form-tender-initiate').addEventListener('submit', (e) => {
+                 e.preventDefault();
+                 const targetId = e.target.querySelector('#tender-modal-target-id').value;
+                 const bondId = e.target.querySelector('#tender-modal-target-bond').value;
+                 const silentPartnerId = e.target.querySelector('#tender-modal-silent-partner').value;
+                 performGameAction('TENDER_INITIATE', { targetId, bondId, silentPartnerId }).catch(console.error);
+                 document.getElementById('tender-modal').classList.add('hidden');
+             });
+        });
+        
+    </script>
+</head>
+<body class="bg-gray-100 font-sans p-4 lg:p-8">
+
+    <!-- Header and Game Status -->
+    <header class="bg-white shadow-xl rounded-xl p-6 mb-6">
+        <h1 class="text-3xl font-extrabold text-indigo-700">JUNKED: The Game of High-Stakes Yields</h1>
+        <div class="mt-4 flex flex-wrap gap-4 text-sm font-semibold">
+            <p class="text-gray-700">Round: <span id="current-round" class="text-lg text-indigo-500">1</span> / <span id="max-rounds">10</span></p>
+            <p class="text-gray-700">Status: <span id="game-status" class="text-lg text-indigo-500">SETUP</span></p>
+            <p class="text-gray-700">Phase: <span id="game-phase" class="text-lg text-indigo-500">Waiting...</span></p>
+            <p class="text-gray-700">Current Player: <span id="current-player" class="text-lg text-orange-500">N/A</span></p>
+        </div>
+    </header>
+
+    <!-- Main Game Area -->
+    <main class="grid grid-cols-1 lg:grid-cols-4 gap-6">
+        
+        <!-- Player Panel & Actions (Col 1) -->
+        <div class="lg:col-span-1 bg-white shadow-xl rounded-xl p-4 sticky top-8 h-fit">
+            <h2 class="text-2xl font-bold text-gray-800 border-b pb-2 mb-3">Your Portfolio</h2>
+            <div class="space-y-2 text-sm">
+                <p class="text-lg font-extrabold" id="player-name">Loading...</p>
+                <p class="font-bold text-green-700">Cash: <span id="player-cash">0</span>k</p>
+                <p class="text-gray-600">T-Bills: <span id="player-tbills">0</span>k (15% Yield)</p>
+                <p class="text-gray-600">Insurance Contracts: <span id="player-insurance">0</span></p>
+                <p class="text-gray-600">Secured Assets: <span id="player-secured-assets">0</span> (<span class="font-bold">250k</span>/ea)</p>
+                <p class="text-lg font-bold text-orange-600 pt-2 border-t mt-3">Actions Left: <span id="player-actions">0</span></p>
+            </div>
+
+            <div id="phase-control" class="mt-4">
+                <!-- Phase control buttons appear here -->
+            </div>
+
+            <h3 class="text-lg font-bold mt-4 border-t pt-3">Trading Floor Actions</h3>
+            <div class="grid grid-cols-2 gap-2 mt-2">
+                <button onclick="document.getElementById('deposit-withdraw-modal').classList.remove('hidden')" class="bg-purple-500 text-white p-2 rounded-lg text-sm hover:bg-purple-600" id="btn-deposit-withdraw">T-Bills</button>
+                <button onclick="performGameAction('RESEARCH')" class="bg-gray-500 text-white p-2 rounded-lg text-sm hover:bg-gray-600" id="btn-research">Research (50k)</button>
+                <button onclick="performGameAction('PURCHASE_INSURANCE')" class="bg-blue-500 text-white p-2 rounded-lg text-sm hover:bg-blue-600" id="btn-insurance">Insurance (75k)</button>
+                <button onclick="document.getElementById('asset-maintenance-modal').classList.remove('hidden');" class="bg-green-500 text-white p-2 rounded-lg text-sm hover:bg-green-600" id="btn-asset-maintenance">Maintain (75k)</button>
+            </div>
+        </div>
+
+        <!-- Market & Portfolios (Col 2-4) -->
+        <div class="lg:col-span-3">
+
+            <!-- Market Event -->
+            <div class="bg-yellow-100 p-4 rounded-xl shadow-inner mb-4">
+                <p class="font-bold text-orange-700">Current Market Event:</p>
+                <p id="current-market-event" class="text-lg text-orange-800">Awaiting market shock...</p>
+            </div>
+            
+            <!-- Tender Offer Status -->
+            <div id="tender-offer-status"></div>
+
+            <!-- Bond Offerings Track -->
+            <h2 class="text-2xl font-bold text-gray-800 border-b pb-2 mb-3">Bond Offerings Track (Buy Action)</h2>
+            <div id="offerings-track" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                <!-- Bonds will be rendered here -->
+            </div>
+
+            <!-- Player Portfolios -->
+            <h2 class="text-2xl font-bold text-gray-800 border-b pb-2 mb-3">Player Portfolios</h2>
+            <div id="portfolios" class="flex flex-wrap -m-2">
+                <!-- Portfolios will be rendered here -->
+            </div>
+        </div>
+        
+        <!-- Game Log (Bottom) -->
+        <div class="lg:col-span-4 bg-white shadow-xl rounded-xl p-4 mt-6">
+            <h2 class="text-xl font-bold text-gray-800 border-b pb-2 mb-3">Game Log (Last 10 Events)</h2>
+            <div id="game-log" class="text-gray-700 space-y-2">
+                <!-- Log entries will be rendered here -->
+            </div>
+        </div>
+    </main>
+
+    <!-- MODAL: Deposit/Withdraw -->
+    <div id="deposit-withdraw-modal" class="fixed inset-0 bg-gray-900 bg-opacity-75 hidden flex items-center justify-center z-50">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-sm">
+            <h3 class="text-xl font-bold mb-4">Deposit/Withdraw T-Bills</h3>
+            <form id="form-deposit-withdraw">
+                <div class="mb-4">
+                    <label class="block text-gray-700 text-sm font-bold mb-2" for="type">Action</label>
+                    <select name="type" required class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline">
+                        <option value="DEPOSIT">Deposit to T-Bills</option>
+                        <option value="WITHDRAW">Withdraw from T-Bills</option>
+                    </select>
+                </div>
+                <div class="mb-4">
+                    <label class="block text-gray-700 text-sm font-bold mb-2" for="amount">Amount (in k, multiple of 100)</label>
+                    <input name="amount" type="number" step="100" min="100" required placeholder="e.g., 500" class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline">
+                </div>
+                <div class="flex justify-between">
+                    <button type="button" onclick="document.getElementById('deposit-withdraw-modal').classList.add('hidden')" class="bg-gray-400 text-white p-2 rounded-lg">Cancel</button>
+                    <button type="submit" class="bg-purple-600 text-white p-2 rounded-lg hover:bg-purple-700">Confirm Action</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <!-- MODAL: Sabotage -->
+    <div id="sabotage-modal" class="fixed inset-0 bg-gray-900 bg-opacity-75 hidden flex items-center justify-center z-50">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-sm">
+            <h3 class="text-xl font-bold mb-4 text-red-600">Sabotage (<span class="font-normal text-sm">Action 6 - 75k</span>)</h3>
+            <p class="text-sm text-gray-700 mb-3">Targeting: <span id="sabotage-modal-target-name" class="font-bold"></span></p>
+            <form id="form-sabotage">
+                <input type="hidden" id="sabotage-modal-target-id" value="">
+                <div class="mb-4">
+                    <label class="block text-gray-700 text-sm font-bold mb-2" for="sabotage-modal-bond">Select Target Bond</label>
+                    <select id="sabotage-modal-bond" name="bondId" required class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline">
+                        <!-- Options populated by JS -->
+                    </select>
+                </div>
+                <p class="text-xs text-red-500 mb-4">NOTE: Sabotage enforces a two-step rating downgrade.</p>
+                <div class="flex justify-between">
+                    <button type="button" onclick="document.getElementById('sabotage-modal').classList.add('hidden')" class="bg-gray-400 text-white p-2 rounded-lg">Cancel</button>
+                    <button type="submit" class="bg-red-600 text-white p-2 rounded-lg hover:bg-red-700">Launch Sabotage</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <!-- MODAL: Asset Maintenance -->
+    <div id="asset-maintenance-modal" class="fixed inset-0 bg-gray-900 bg-opacity-75 hidden flex items-center justify-center z-50">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-sm">
+            <h3 class="text-xl font-bold mb-4 text-green-600">Asset Maintenance (<span class="font-normal text-sm">Action 8 - 75k</span>)</h3>
+            <form id="form-asset-maintenance">
+                <div class="mb-4">
+                    <label class="block text-gray-700 text-sm font-bold mb-2" for="asset-maintenance-bond">Select Bond to Upgrade</label>
+                    <select id="asset-maintenance-bond" name="bondId" required class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline">
+                        <!-- Options populated by JS -->
+                    </select>
+                </div>
+                <p class="text-xs text-gray-500 mb-4">NOTE: This action can only upgrade a bond one step, up to a maximum of **BB** rating.</p>
+                <div class="flex justify-between">
+                    <button type="button" onclick="document.getElementById('asset-maintenance-modal').classList.add('hidden')" class="bg-gray-400 text-white p-2 rounded-lg">Cancel</button>
+                    <button type="submit" class="bg-green-600 text-white p-2 rounded-lg hover:bg-green-700">Apply Maintenance</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- MODAL: Hostile Tender -->
+    <div id="tender-modal" class="fixed inset-0 bg-gray-900 bg-opacity-75 hidden flex items-center justify-center z-50">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-lg">
+            <h3 class="text-xl font-bold mb-4 text-red-800">Hostile Tender Offer (<span class="font-normal text-sm">Action 7 - 200k Bribe</span>)</h3>
+            <form id="form-tender-initiate">
+                <input type="hidden" id="tender-modal-target-id" value="">
+                <input type="hidden" id="tender-modal-target-bond" value="">
+                <input type="hidden" id="tender-modal-target-name" value="">
+
+
+                <div class="space-y-4">
+                    <p class="text-sm text-gray-700 font-semibold">Initiating offer against: <span id="tender-modal-target-name-display" class="font-bold"></span></p>
+                    
+                    <div class="mb-4">
+                        <label class="block text-gray-700 text-sm font-bold mb-2" for="tender-modal-silent-partner">Silent Partner</label>
+                        <select id="tender-modal-silent-partner" name="silentPartnerId" required class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline">
+                            <!-- Options populated by JS -->
+                        </select>
+                    </div>
+
+                    <p class="text-xs text-red-500">WARNING: The Silent Partner must be solvent (have enough liquid cash) to cover the $300k RICO Fine and the $200k Bribe repayment if the **Due Diligence Backfire** occurs.</p>
+                </div>
+                
+                <div class="flex justify-between mt-6">
+                    <button type="button" onclick="document.getElementById('tender-modal').classList.add('hidden')" class="bg-gray-400 text-white p-2 rounded-lg">Cancel</button>
+                    <button type="submit" class="bg-red-800 text-white p-2 rounded-lg hover:bg-red-900">Initiate Tender Offer</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
