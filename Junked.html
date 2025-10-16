@@ -202,16 +202,12 @@
 
         const initOrLoadGame = async (id) => {
             const gameRef = doc(db, DB_PATH(id));
-            let initialState = null;
+            let initialState = null; // Declare initialState here
 
             // Set up listener first
             onSnapshot(gameRef, (doc) => {
                 if (doc.exists()) {
                     updateUI(doc.data());
-                } else if (doc.metadata.hasPendingWrites === false) {
-                     // If doc doesn't exist and there are no pending writes, 
-                     // we can't update the UI yet, but we wait for the transaction to complete.
-                     console.log("Waiting for game initialization transaction to complete.");
                 }
             });
 
@@ -253,7 +249,7 @@
                         }
 
 
-                        initialState = {
+                        initialState = { // Set initialState inside the transaction
                             round: 1,
                             phase: 1, // 1: Yield, 2: Shock, 3: Trading
                             status: 'SETUP',
@@ -300,15 +296,21 @@
                                 };
                                 initialState.players[userId].bonds.push(starterBond);
                             }
-                             transaction.update(gameRef, { players: initialState.players });
-                             console.log(`Updated player list with new user ${playerName}.`);
+                             // Only update player list if not full and in setup
+                             if(initialState.status === 'SETUP' && initialState.playerOrder.length < 4) {
+                                 initialState.playerOrder.push(userId);
+                                 transaction.update(gameRef, { 
+                                     players: initialState.players,
+                                     playerOrder: initialState.playerOrder,
+                                     log: [...initialState.log, { time: new Date().toISOString(), message: `${playerName} joined the game (auto-added).` }]
+                                 });
+                                 console.log(`Updated player list with new user ${playerName}.`);
+                             }
                          }
                     }
                 });
                 
-                // CRITICAL FIX: After the transaction is committed, force the UI to render the current state.
-                // If initialState was set during initialization or updated during the existence check, use that data.
-                // Otherwise, the onSnapshot listener will eventually fire with the state.
+                // CRITICAL FIX: Force immediate UI update after transaction
                 const finalSnap = await getDoc(gameRef);
                 if (finalSnap.exists()) {
                     updateUI(finalSnap.data());
@@ -694,6 +696,11 @@
 
                             game.tenderOffer = null; // Clear the offer
 
+                            // FIX: Update player objects modified in TENDER_RESOLVE before transaction.set
+                            game.players[userId] = player;
+                            game.players[silentPartnerId] = silentPartnerRes;
+                            game.players[targetIdRes] = targetPlayerRes;
+
                             // No action deduction as this is a resolution step outside the normal action limit
                             break;
                     }
@@ -702,9 +709,10 @@
                         game.log.push({ time: new Date().toISOString(), message: logMessage });
                     }
 
-                    game.players[userId] = player; // Update current player data
-                    game.players[silentPartnerId] = silentPartnerRes;
-                    game.players[targetIdRes] = targetPlayerRes;
+                    // Only update the player object if it was the current player executing a non-Tender action
+                    if (isPhase3Action && actionType !== 'TENDER_RESOLVE') {
+                        game.players[userId] = player; 
+                    }
 
                     transaction.set(gameRef, game);
 
@@ -823,12 +831,14 @@
             phaseControl.innerHTML = '';
             
             if (game.status === 'SETUP') {
-                if (!game.playerOrder.includes(userId)) {
-                    // This scenario should rarely happen after the transaction fix, but ensures a joining option.
-                    phaseControl.innerHTML += `<button onclick="performGameAction('JOIN')" class="bg-blue-600 text-white p-2 rounded-lg hover:bg-blue-700">Join Game</button>`;
-                } else if (game.playerOrder.length < 3) {
-                     phaseControl.innerHTML += `<p class="text-sm mt-2 text-yellow-600">Need at least 3 players to start (currently ${game.playerOrder.length}).</p>`;
-                } else {
+                if (!game.playerOrder.includes(userId) || game.playerOrder.length < 3) {
+                     // If player not joined, or waiting for players
+                    phaseControl.innerHTML += `<button onclick="performGameAction('JOIN')" class="bg-blue-600 text-white p-2 rounded-lg hover:bg-blue-700 disabled:opacity-50" ${game.playerOrder.includes(userId) ? 'disabled' : ''}>${game.playerOrder.includes(userId) ? 'Joined' : 'Join Game'}</button>`;
+                    if (game.playerOrder.length < 3) {
+                        phaseControl.innerHTML += `<p class="text-sm mt-2 text-yellow-600">Need 3-4 players to start (currently ${game.playerOrder.length}).</p>`;
+                    }
+                } else if (game.playerOrder.includes(userId) && game.playerOrder.length >= 3) {
+                    // Player is in, game is ready to start
                     phaseControl.innerHTML += `<button onclick="performGameAction('START_GAME')" class="bg-indigo-600 text-white p-2 ml-2 rounded-lg hover:bg-indigo-700">Start Game</button>`;
                 }
 
@@ -853,7 +863,7 @@
             renderPortfolios(game);
             
             // Setup modals with current game data
-            setupModals(game);
+            window.setupModals(game);
         };
 
         const renderTenders = (game) => {
@@ -928,7 +938,7 @@
                     const actionButtons = isMine && isCurrent && game.phase === 3 && !game.tenderOffer ? `
                         <button onclick="performGameAction('SELL_BOND', {bondId: '${bond.id}'})" class="text-xs bg-red-400 text-white p-1 rounded-md hover:bg-red-500 disabled:opacity-50" ${isDefaulted ? 'disabled' : ''}>Sell (${sellPrice}k)</button>
                     ` : !isMine && game.phase === 3 && !game.tenderOffer && isTargetable ? `
-                        <button onclick="document.getElementById('tender-modal-target-bond').value='${bond.id}'; document.getElementById('tender-modal-target-id').value='${pId}'; document.getElementById('tender-modal-target-name').textContent='${player.name}'; setupModals(game); document.getElementById('tender-modal').classList.remove('hidden');" class="text-xs bg-red-800 text-white p-1 rounded-md hover:bg-red-900">Tender Offer</button>
+                        <button onclick="document.getElementById('tender-modal-target-bond').value='${bond.id}'; document.getElementById('tender-modal-target-id').value='${pId}'; document.getElementById('tender-modal-target-name').value='${player.name}'; window.setupModals(game); document.getElementById('tender-modal').classList.remove('hidden');" class="text-xs bg-red-800 text-white p-1 rounded-md hover:bg-red-900">Tender Offer</button>
                     ` : '';
 
                     return `
@@ -942,13 +952,8 @@
                 }).join('');
 
                 const sabotageButton = isCurrent && game.phase === 3 && !game.tenderOffer && !isMine ? `
-                     <button onclick="document.getElementById('sabotage-modal-target-id').value='${pId}'; document.getElementById('sabotage-modal-target-name').textContent='${player.name}'; setupModals(game); document.getElementById('sabotage-modal').classList.remove('hidden');" class="mt-2 w-full bg-red-900 text-white p-2 rounded-lg hover:bg-red-800">Sabotage (${GAME_CONSTANTS.COST_SABOTAGE}k)</button>
+                     <button onclick="document.getElementById('sabotage-modal-target-id').value='${pId}'; document.getElementById('sabotage-modal-target-name').textContent='${player.name}'; window.setupModals(game); document.getElementById('sabotage-modal').classList.remove('hidden');" class="mt-2 w-full bg-red-900 text-white p-2 rounded-lg hover:bg-red-800">Sabotage (${GAME_CONSTANTS.COST_SABOTAGE}k)</button>
                 ` : '';
-                
-                const mySabotageButton = isMine && isCurrent && game.phase === 3 && !game.tenderOffer ? `
-                    <button onclick="document.getElementById('sabotage-modal-target-id').value='${pId}'; document.getElementById('sabotage-modal-target-name').textContent='${player.name}'; setupModals(game); document.getElementById('sabotage-modal').classList.remove('hidden');" class="mt-2 w-full bg-red-900 text-white p-2 rounded-lg hover:bg-red-800">Sabotage (${GAME_CONSTANTS.COST_SABOTAGE}k)</button>
-                ` : '';
-
 
                 return `
                     <div class="w-full lg:w-1/2 p-2">
@@ -975,7 +980,6 @@
              // Populate Silent Partner Select in Tender Modal
             const silentPartnerSelect = document.getElementById('tender-modal-silent-partner');
             if (silentPartnerSelect) {
-                const currentRaider = game.players[userId];
                 const targetId = document.getElementById('tender-modal-target-id').value;
                 const otherPlayers = game.playerOrder.filter(pId => pId !== userId && pId !== targetId);
                 
@@ -1019,11 +1023,18 @@
                      });
                 }
             }
+            
+            // Set Target Name for Tender Modal Display
+            const tenderTargetNameInput = document.getElementById('tender-modal-target-name');
+            const tenderTargetNameDisplay = document.getElementById('tender-modal-target-name-display');
+            if(tenderTargetNameInput && tenderTargetNameDisplay) {
+                tenderTargetNameDisplay.textContent = tenderTargetNameInput.value;
+            }
         };
 
         window.onload = initFirebase;
         window.performGameAction = performGameAction; // Make callable from HTML
-        window.setupModals = setupModals; // Make callable for dynamic button activation
+        window.setupModals = setupModals; // FIX: Make setupModals globally accessible
 
         // --- Modals for trading actions ---
         document.addEventListener('DOMContentLoaded', () => {
@@ -1037,6 +1048,9 @@
                  const el = document.getElementById(btn.id);
                  if(el) { el.textContent = `${el.textContent.split('(')[0].trim()} (${btn.cost}k)`; }
              });
+             
+             document.getElementById('btn-asset-maintenance').textContent = `Maintain (${GAME_CONSTANTS.COST_ASSET_MAINTENANCE}k)`;
+
 
              // Submit handlers
              document.getElementById('form-deposit-withdraw').addEventListener('submit', (e) => {
@@ -1111,7 +1125,7 @@
                 <button onclick="document.getElementById('deposit-withdraw-modal').classList.remove('hidden')" class="bg-purple-500 text-white p-2 rounded-lg text-sm hover:bg-purple-600" id="btn-deposit-withdraw">T-Bills</button>
                 <button onclick="performGameAction('RESEARCH')" class="bg-gray-500 text-white p-2 rounded-lg text-sm hover:bg-gray-600" id="btn-research">Research (50k)</button>
                 <button onclick="performGameAction('PURCHASE_INSURANCE')" class="bg-blue-500 text-white p-2 rounded-lg text-sm hover:bg-blue-600" id="btn-insurance">Insurance (75k)</button>
-                <button onclick="document.getElementById('asset-maintenance-modal').classList.remove('hidden'); setupModals(game);" class="bg-green-500 text-white p-2 rounded-lg text-sm hover:bg-green-600" id="btn-asset-maintenance">Maintain (75k)</button>
+                <button onclick="document.getElementById('asset-maintenance-modal').classList.remove('hidden');" class="bg-green-500 text-white p-2 rounded-lg text-sm hover:bg-green-600" id="btn-asset-maintenance">Maintain (75k)</button>
             </div>
         </div>
 
