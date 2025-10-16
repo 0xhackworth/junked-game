@@ -7,9 +7,10 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
     <script type="module">
-        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, query, runTransaction, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        // Updated SDK versions to 12.4.0 for consistency with user's snippet
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-auth.js";
+        import { getFirestore, doc, getDoc, setDoc, onSnapshot, runTransaction } from "https://www.gstatic.com/firebasejs/12.4.0/firebase-firestore.js";
 
         // --- GLOBAL VARIABLES AND CONSTANTS ---
 
@@ -18,7 +19,7 @@
         let userId;
         let gameId;
         const GAME_SESSION_ID = 'game-session-1'; // Fixed ID for shared session
-        const APP_ID = typeof __app_id !== 'undefined' ? __app_id : 'default-junked-app';
+        const APP_ID = 'junked-game'; // Using the projectId as a stable App ID placeholder
         const DB_PATH = (id) => `artifacts/${APP_ID}/public/data/junked_games/${id}`;
 
         // Game Constants based on the final rulebook
@@ -159,7 +160,17 @@
         
         const initFirebase = async () => {
             try {
-                const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+                // --- INJECTED FIREBASE CONFIGURATION (User provided) ---
+                const firebaseConfig = {
+                    apiKey: "AIzaSyCqMdhBWcXEfCw575HMHgsS2cRR64wBEBE",
+                    authDomain: "junked-game.firebaseapp.com",
+                    projectId: "junked-game",
+                    storageBucket: "junked-game.firebasestorage.app",
+                    messagingSenderId: "150414672185",
+                    appId: "1:150414672185:web:5f48e37eacf96f0552e8e8"
+                };
+                // --- END OF INJECTED FIREBASE CONFIGURATION ---
+
                 const app = initializeApp(firebaseConfig);
                 db = getFirestore(app);
                 auth = getAuth(app);
@@ -809,15 +820,22 @@
             document.getElementById('game-phase').textContent = ['Yield Collection', 'Market Shock', 'Trading Floor'][game.phase - 1] || 'N/A';
             
             const currentPlayerId = game.playerOrder[game.currentPlayerIndex];
-            const isCurrentPlayer = currentPlayerId === userId;
+            const isCurrentPlayer = game.playerOrder.includes(userId) && currentPlayerId === userId;
             const myPlayer = game.players[userId];
+
+            // Ensure myPlayer exists before trying to access properties
+            if (!myPlayer) {
+                 document.getElementById('player-name').textContent = 'Connecting...';
+                 document.getElementById('phase-control').innerHTML = '<p class="text-sm mt-2 text-yellow-600">Attempting to join game session...</p>';
+                 return; 
+            }
             
-            document.getElementById('player-name').textContent = myPlayer?.name || 'Loading...';
-            document.getElementById('player-cash').textContent = myPlayer?.cash?.toLocaleString() || '0';
-            document.getElementById('player-tbills').textContent = myPlayer?.tBills?.toLocaleString() || '0';
-            document.getElementById('player-insurance').textContent = myPlayer?.insuranceContracts || '0';
-            document.getElementById('player-secured-assets').textContent = myPlayer?.securedAssets || '0';
-            document.getElementById('player-actions').textContent = myPlayer?.actionsLeft || '0';
+            document.getElementById('player-name').textContent = myPlayer.name || 'Loading...';
+            document.getElementById('player-cash').textContent = myPlayer.cash?.toLocaleString() || '0';
+            document.getElementById('player-tbills').textContent = myPlayer.tBills?.toLocaleString() || '0';
+            document.getElementById('player-insurance').textContent = myPlayer.insuranceContracts || '0';
+            document.getElementById('player-secured-assets').textContent = myPlayer.securedAssets || '0';
+            document.getElementById('player-actions').textContent = myPlayer.actionsLeft || '0';
             document.getElementById('current-player').textContent = game.players[currentPlayerId]?.name || getPlayerDisplayId(currentPlayerId);
             
             // Log
@@ -831,12 +849,12 @@
             phaseControl.innerHTML = '';
             
             if (game.status === 'SETUP') {
-                if (!game.playerOrder.includes(userId) || game.playerOrder.length < 3) {
-                     // If player not joined, or waiting for players
-                    phaseControl.innerHTML += `<button onclick="performGameAction('JOIN')" class="bg-blue-600 text-white p-2 rounded-lg hover:bg-blue-700 disabled:opacity-50" ${game.playerOrder.includes(userId) ? 'disabled' : ''}>${game.playerOrder.includes(userId) ? 'Joined' : 'Join Game'}</button>`;
-                    if (game.playerOrder.length < 3) {
-                        phaseControl.innerHTML += `<p class="text-sm mt-2 text-yellow-600">Need 3-4 players to start (currently ${game.playerOrder.length}).</p>`;
-                    }
+                if (!game.playerOrder.includes(userId)) {
+                    // Player is not in the player order list (manual join needed if auto-add failed)
+                    phaseControl.innerHTML += `<button onclick="performGameAction('JOIN')" class="bg-blue-600 text-white p-2 rounded-lg hover:bg-blue-700">Join Game</button>`;
+                } else if (game.playerOrder.length < 3) {
+                     // Player is in, waiting for more players
+                     phaseControl.innerHTML += `<p class="text-sm mt-2 text-yellow-600">Waiting for 3-4 players (currently ${game.playerOrder.length}).</p>`;
                 } else if (game.playerOrder.includes(userId) && game.playerOrder.length >= 3) {
                     // Player is in, game is ready to start
                     phaseControl.innerHTML += `<button onclick="performGameAction('START_GAME')" class="bg-indigo-600 text-white p-2 ml-2 rounded-lg hover:bg-indigo-700">Start Game</button>`;
